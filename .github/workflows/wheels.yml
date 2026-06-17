@@ -20,8 +20,15 @@ jobs:
       - name: Set up MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - uses: pypa/cibuildwheel@v4.1.0
+        env:
+          CIBW_ARCHS_WINDOWS: AMD64
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_ARCHS_MACOS: auto
+          CIBW_SKIP: "*-musllinux_*"
 
       - uses: actions/upload-artifact@v4
         with:
