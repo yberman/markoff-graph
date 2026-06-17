@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "markoff-graph"
+version = "0.1.0"
+description = "Small ctypes wrapper for finite-field Markoff graph components"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Yosef Berman" }]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["markoff_graph"]
+
+[tool.setuptools.package-data]
+markoff_graph = ["libmarkoff.c", "libmarkoff.so", "libmarkoff.dylib", "libmarkoff.dll"]
+
+[tool.cibuildwheel]
+build = "cp311-*"
+test-command = "python -m pytest {project}/tests"
+test-requires = ["pytest"]
