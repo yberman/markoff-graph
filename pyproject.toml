@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "markoff-graph"
-version = "0.0.1"
+version = "0.0.2"
 description = "Finite-field Markoff graph components"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -19,8 +19,7 @@ packages = ["markoff_graph"]
 markoff_graph = ["libmarkoff.c", "libmarkoff.so", "libmarkoff.dylib", "libmarkoff.dll"]
 
 [tool.cibuildwheel]
-build = "cp311-*"
-skip = "*-musllinux_*"
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-win32"
 test-command = "python -m pytest {project}/tests"
 test-requires = ["pytest"]
-
