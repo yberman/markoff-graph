@@ -5,11 +5,20 @@
  *
  *     x^2 + y^2 + z^2 = x*y*z + A*x + B*y + C*z + D  (mod p).
  *
- * The Python wrapper exposes triples only.  The C ABI returns encoded vertices
+ * The Python wrapper exposes triples only. The C ABI returns flat uint16_t
+ * triple arrays:
  *
- *     V = x + p*y + p*p*z,     0 <= x,y,z < p,
+ *     vertices_xyz = [x0, y0, z0, x1, y1, z1, ...]
+ *     roots_xyz    = [rx0, ry0, rz0, rx1, ry1, rz1, ...]
  *
- * as uint32_t arrays.  We reject p > 1621 so every possible V fits in uint32_t.
+ * parallel to one another. There is no packed integer vertex encoding.
+ *
+ * Bounds:
+ *
+ *   - Coordinates are uint16_t, so 0 <= x,y,z < p must fit in uint16_t.
+ *   - The solution count is at most 2*p*p because for each (x,y) we solve a
+ *     quadratic in z. We require 2*p*p <= UINT32_MAX so every node index and
+ *     node count fits in uint32_t.
  *
  * Internal lookup design:
  *
@@ -26,25 +35,28 @@
  * Exported ABI:
  *
  *     int build_graph(int A, int B, int C, int D, int prime,
- *                     uint32_t capacity, int *V_len,
- *                     uint32_t *Vs, uint32_t *root)
+ *                     uint32_t capacity,
+ *                     uint32_t *node_count,
+ *                     uint32_t *component_count,
+ *                     uint16_t *vertices_xyz,
+ *                     uint16_t *roots_xyz)
  *
- * The caller owns Vs and root, each of length at least capacity.
- * On success, Vs[0..V_len) are encoded vertices and root[0..V_len) are encoded
- * component roots parallel to Vs.  The return value is the component count.
+ * The caller owns vertices_xyz and roots_xyz, each of length at least
+ * 3*capacity.
  *
  * Return values:
- *   >=0 connected component count
- *   -1  invalid input pointer, modulus <= 1, or capacity too large for int
+ *    0  success
+ *   -1  invalid input pointer, modulus <= 1, capacity invalid, or size overflow
  *   -2  too many solutions for caller-provided capacity
  *   -3  allocation failure
  *   -4  internal error: a Vieta neighbor was not found among solutions
- *   -5  modulus > 1621, so uint32 vertex encoding is not guaranteed safe
+ *   -5  modulus too large for uint16 coordinates or uint32 node count
  *   -6  modulus is composite; this builder requires a prime field
  *   -7  internal error: more than two solutions share a fixed coordinate pair
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <limits.h>
 
@@ -58,8 +70,8 @@
 extern "C" {
 #endif
 
-#define MARKOFF_MAX_PRIME_U32 1621
 #define U32_MISSING UINT32_MAX
+#define MARKOFF_MAX_PRIME_BY_NODE_COUNT 46340u
 
 typedef struct {
     uint16_t x;
@@ -84,12 +96,10 @@ static int modp_ll(long long a, int p) {
     return (int)r;
 }
 
-static uint32_t encode_v_u32(int x, int y, int z, int p) {
-    uint64_t pp = (uint64_t)(uint32_t)p * (uint64_t)(uint32_t)p;
-    uint64_t v = (uint64_t)(uint32_t)x
-               + (uint64_t)(uint32_t)p * (uint64_t)(uint32_t)y
-               + pp * (uint64_t)(uint32_t)z;
-    return (uint32_t)v;
+static int prime_fits_storage_bound(int p) {
+    if (p <= 1) return 0;
+    if ((uint32_t)p > (uint32_t)UINT16_MAX) return 0;
+    return 2ull * (uint64_t)(uint32_t)p * (uint64_t)(uint32_t)p <= (uint64_t)UINT32_MAX;
 }
 
 static size_t pair_offset(int a, int b, int p) {
@@ -166,7 +176,7 @@ static void uf_union_min(SolutionNode *nodes, uint32_t a, uint32_t b) {
 
 static int add_solution(
     SolutionNode *nodes,
-    uint32_t *Vs,
+    uint16_t *vertices_xyz,
     uint32_t *n,
     uint32_t capacity,
     uint32_t *xy,
@@ -177,6 +187,7 @@ static int add_solution(
     int z,
     int p
 ) {
+    (void)p;
     if (*n >= capacity) return -2;
 
     uint32_t i = *n;
@@ -184,7 +195,11 @@ static int add_solution(
     nodes[i].y = (uint16_t)y;
     nodes[i].z = (uint16_t)z;
     nodes[i].parent = i;
-    Vs[i] = encode_v_u32(x, y, z, p);
+
+    size_t out = 3u * (size_t)i;
+    vertices_xyz[out] = (uint16_t)x;
+    vertices_xyz[out + 1u] = (uint16_t)y;
+    vertices_xyz[out + 2u] = (uint16_t)z;
 
     if (!table_insert(xy, p, x, y, i)) return -7;
     if (!table_insert(xz, p, x, z, i)) return -7;
@@ -208,16 +223,21 @@ MARKOFF_EXPORT int build_graph(
     int A, int B, int C, int D,
     int prime,
     uint32_t capacity,
-    int *V_len,
-    uint32_t *Vs,
-    uint32_t *root
+    uint32_t *node_count,
+    uint32_t *component_count,
+    uint16_t *vertices_xyz,
+    uint16_t *roots_xyz
 ) {
-    if (prime <= 1 || capacity > (uint32_t)INT_MAX ||
-        V_len == NULL || Vs == NULL || root == NULL) {
+    if (prime <= 1 || capacity == 0 ||
+        node_count == NULL || component_count == NULL ||
+        vertices_xyz == NULL || roots_xyz == NULL) {
         return -1;
     }
-    if (prime > MARKOFF_MAX_PRIME_U32) return -5;
+    if (!prime_fits_storage_bound(prime)) return -5;
     if (!is_prime_small(prime)) return -6;
+
+    if ((size_t)capacity > SIZE_MAX / sizeof(SolutionNode)) return -1;
+    if ((size_t)capacity > SIZE_MAX / (3u * sizeof(uint16_t))) return -1;
 
     const int p = prime;
     const int Am = modp_ll(A, p);
@@ -225,7 +245,10 @@ MARKOFF_EXPORT int build_graph(
     const int Cm = modp_ll(C, p);
     const int Dm = modp_ll(D, p);
 
-    const size_t pair_slots = 2u * (size_t)(uint32_t)p * (size_t)(uint32_t)p;
+    const uint64_t pair_slots64 = 2ull * (uint64_t)(uint32_t)p * (uint64_t)(uint32_t)p;
+    if (pair_slots64 > (uint64_t)SIZE_MAX / sizeof(uint32_t)) return -1;
+    const size_t pair_slots = (size_t)pair_slots64;
+
     SolutionNode *nodes = (SolutionNode *)malloc((size_t)capacity * sizeof(SolutionNode));
     uint32_t *xy = (uint32_t *)malloc(pair_slots * sizeof(uint32_t));
     uint32_t *xz = (uint32_t *)malloc(pair_slots * sizeof(uint32_t));
@@ -248,9 +271,11 @@ MARKOFF_EXPORT int build_graph(
                     int rhs = modp_ll(1LL*x*y*z + (long long)Am*x + (long long)Bm*y +
                                       (long long)Cm*z + Dm, p);
                     if (lhs == rhs) {
-                        int ok = add_solution(nodes, Vs, &n, capacity, xy, xz, yz, x, y, z, p);
+                        int ok = add_solution(nodes, vertices_xyz, &n, capacity,
+                                              xy, xz, yz, x, y, z, p);
                         if (ok < 0) {
-                            *V_len = (int)n;
+                            *node_count = n;
+                            *component_count = 0;
                             free_all(nodes, xy, xz, yz, NULL, NULL);
                             return ok;
                         }
@@ -290,9 +315,11 @@ MARKOFF_EXPORT int build_graph(
                 for (int k = 0; k < cnt; ++k) {
                     int r = sqrt_roots[2*disc + k];
                     int z = modp_ll((long long)(S + r) * inv2, p);
-                    int ok = add_solution(nodes, Vs, &n, capacity, xy, xz, yz, x, y, z, p);
+                    int ok = add_solution(nodes, vertices_xyz, &n, capacity,
+                                          xy, xz, yz, x, y, z, p);
                     if (ok < 0) {
-                        *V_len = (int)n;
+                        *node_count = n;
+                        *component_count = 0;
                         free_all(nodes, xy, xz, yz, sqrt_count, sqrt_roots);
                         return ok;
                     }
@@ -304,8 +331,9 @@ MARKOFF_EXPORT int build_graph(
         free(sqrt_roots);
     }
 
-    *V_len = (int)n;
+    *node_count = n;
     if (n == 0) {
+        *component_count = 0;
         free_all(nodes, xy, xz, yz, NULL, NULL);
         return 0;
     }
@@ -336,15 +364,19 @@ MARKOFF_EXPORT int build_graph(
         nodes[i].parent = uf_find(nodes, i);
     }
 
-    int components = 0;
+    uint32_t components = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        if (nodes[i].parent == i) components += 1;
+        if (nodes[i].parent == i) components += 1u;
         SolutionNode *r = &nodes[nodes[i].parent];
-        root[i] = encode_v_u32((int)r->x, (int)r->y, (int)r->z, p);
+        size_t out = 3u * (size_t)i;
+        roots_xyz[out] = r->x;
+        roots_xyz[out + 1u] = r->y;
+        roots_xyz[out + 2u] = r->z;
     }
 
+    *component_count = components;
     free_all(nodes, xy, xz, yz, NULL, NULL);
-    return components;
+    return 0;
 }
 
 #ifdef __cplusplus

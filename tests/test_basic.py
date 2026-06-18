@@ -26,3 +26,30 @@ def test_component_rejects_non_root():
         pass
     else:
         raise AssertionError("expected KeyError")
+
+
+def test_capacity_error_is_reported():
+    try:
+        markoff(4, 4, -2, -4, 31, capacity=1)
+    except RuntimeError as exc:
+        assert "too many solutions" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_prime_bound_is_not_old_1621_bound():
+    try:
+        markoff(4, 4, -2, -4, 1627, capacity=1)
+    except RuntimeError as exc:
+        assert "too many solutions" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_rejects_prime_above_uint32_node_bound():
+    try:
+        markoff(4, 4, -2, -4, 46349)
+    except ValueError as exc:
+        assert "2*p*p must fit in uint32" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
