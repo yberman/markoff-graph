@@ -12,7 +12,8 @@ The graph object exposes:
     G.nodes()                 iterator of solution triples (x, y, z)
     G.edges()                 iterator of directed edges ((x,y,z), (x',y',z'))
     G.roots()                 dict: component-root triple -> component size
-    G.component()             dict: component-root triple -> set of node triples
+    G.components()            dict: component-root triple -> set of node triples
+    G.component((x, y, z))    set of node triples in one component
     G.neighbors((x, y, z))    3-tuple of Vieta-neighbor triples
 """
 
@@ -181,7 +182,7 @@ class _MarkoffGraph:
     def roots(self) -> Dict[Triple, int]:
         return dict(self._root_sizes)
 
-    def component(self) -> Dict[Triple, Set[Triple]]:
+    def components(self) -> Dict[Triple, Set[Triple]]:
         p = self._prime
         components: Dict[Triple, Set[Triple]] = {}
         for V, R in zip(self._nodes_u32, self._roots_u32):
@@ -189,6 +190,18 @@ class _MarkoffGraph:
             node = _decode_vertex(int(V), p)
             components.setdefault(root, set()).add(node)
         return components
+
+    def component(self, root: Triple) -> Set[Triple]:
+        p = self._prime
+        root = _normalize(root, p)
+        if root not in self._root_sizes:
+            raise KeyError(f"not a component root modulo {p}: {root!r}")
+
+        nodes: Set[Triple] = set()
+        for V, R in zip(self._nodes_u32, self._roots_u32):
+            if _decode_vertex(int(R), p) == root:
+                nodes.add(_decode_vertex(int(V), p))
+        return nodes
 
     def neighbors(self, vertex: Triple) -> Tuple[Triple, Triple, Triple]:
         p = self._prime
