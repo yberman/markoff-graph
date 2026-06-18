@@ -22,13 +22,41 @@ class BuildPy(build_py):
 
         if system == "Linux":
             out = PKG / "libmarkoff.so"
-            cmd = ["gcc", "-O3", "-shared", "-fPIC", "-o", str(out), str(SRC)]
+            cmd = [
+                "gcc",
+                "-O3",
+                "-DNDEBUG",
+                "-shared",
+                "-fPIC",
+                "-o",
+                str(out),
+                str(SRC),
+                "-lm",
+            ]
         elif system == "Darwin":
             out = PKG / "libmarkoff.dylib"
-            cmd = ["clang", "-O3", "-dynamiclib", "-o", str(out), str(SRC)]
+            cmd = [
+                "clang",
+                "-O3",
+                "-DNDEBUG",
+                "-dynamiclib",
+                "-o",
+                str(out),
+                str(SRC),
+            ]
         elif system == "Windows":
+            # MSVC does not have a literal /O3 flag.  /O2 is the standard
+            # "maximize speed" release optimization flag for cl.exe.
             out = PKG / "libmarkoff.dll"
-            cmd = ["cl", "/nologo", "/O2", "/LD", f"/Fe{out}", str(SRC)]
+            cmd = [
+                "cl",
+                "/nologo",
+                "/O2",
+                "/DNDEBUG",
+                "/LD",
+                f"/Fe{out}",
+                str(SRC),
+            ]
         else:
             raise RuntimeError(f"unsupported platform: {system}")
 

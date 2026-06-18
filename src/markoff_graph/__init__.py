@@ -1,20 +1,21 @@
-"""Graphs of Markoff-type surfaces over prime fields.
+"""Finite-field Markoff graph components.
 
-Usage:
+Core usage:
 
-    from markoff_graph import markoff
+    from markoff_graph import MarkoffGraph
 
-    G = markoff(4, 4, -2, -4, 31)
+    G = MarkoffGraph(4, 4, -2, -4, 31)
     print(G.roots())
 
-The graph object exposes:
+The core graph object exposes only:
 
-    G.nodes()                 iterator of solution triples (x, y, z)
-    G.edges()                 iterator of directed edges ((x,y,z), (x',y',z'))
-    G.roots()                 dict: component-root triple -> component size
-    G.components()            dict: component-root triple -> set of node triples
-    G.component((x, y, z))    set of node triples in one component
-    G.neighbors((x, y, z))    3-tuple of Vieta-neighbor triples
+    G.nodes()          iterator of solution triples
+    G.roots()          dict: component-root triple -> component size
+    G.component(root)  set of solution triples in one component
+
+Optional SciPy usage:
+
+    G.eig(root)       second adjacency eigenpair for one component
 """
 
 from __future__ import annotations
@@ -22,27 +23,64 @@ from __future__ import annotations
 import ctypes as _ct
 import os
 import platform
-from array import array
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Set, Tuple
 
 Triple = Tuple[int, int, int]
 
-__all__ = ["Triple", "markoff"]
-__version__ = "0.1.0"
+__all__ = ["MarkoffGraph", "Triple"]
+__version__ = "0.0.6"
 
-_MAX_PRIME_U32 = 1621
-_U32_ARRAY_CODE = "I"
+_MAX_PRIME_BY_NODE_COUNT = 46340
 
 _ERROR_MESSAGES = {
-    -1: "invalid input pointer, prime <= 1, or capacity too large",
-    -2: "too many solutions for the allocated uint32 buffers",
+    -1: "invalid argument",
+    -2: "too many solutions for the internal node bound",
     -3: "allocation failure inside libmarkoff",
     -4: "internal error: Vieta neighbor was not found among solutions",
-    -5: f"prime > {_MAX_PRIME_U32}; uint32 vertex encoding may overflow",
+    -5: "prime is too large for uint16 coordinates or uint32 node count",
     -6: "modulus is not prime; this builder uses field arithmetic",
     -7: "internal error: too many solutions share a fixed coordinate pair",
+    -8: "internal error while building component data or CSR arrays",
 }
+
+
+class _CNode(_ct.Structure):
+    _fields_ = [
+        ("x", _ct.c_uint16),
+        ("y", _ct.c_uint16),
+        ("z", _ct.c_uint16),
+        ("pad", _ct.c_uint16),
+        ("root", _ct.c_uint32),
+        ("neighbor0", _ct.c_uint32),
+        ("neighbor1", _ct.c_uint32),
+        ("neighbor2", _ct.c_uint32),
+        ("eigenvector", _ct.c_double),
+    ]
+
+
+class _CComponent(_ct.Structure):
+    pass
+
+
+_CComponent._fields_ = [
+    ("root", _ct.POINTER(_CNode)),
+    ("root_index", _ct.c_uint32),
+    ("size", _ct.c_uint32),
+    ("eigenvalue", _ct.c_double),
+]
+
+
+class _CCSR(_ct.Structure):
+    _fields_ = [
+        ("size", _ct.c_uint32),
+        ("nnz", _ct.c_uint32),
+        ("root_index", _ct.c_uint32),
+        ("data", _ct.POINTER(_ct.c_double)),
+        ("indices", _ct.POINTER(_ct.c_int)),
+        ("indptr", _ct.POINTER(_ct.c_int)),
+        ("nodes", _ct.POINTER(_ct.c_uint32)),
+    ]
 
 
 def _library_names() -> List[str]:
@@ -83,15 +121,41 @@ def _load_library(path: str | os.PathLike[str] | None = None) -> _ct.CDLL:
 
 
 def _configure_library(lib: _ct.CDLL) -> _ct.CDLL:
-    lib.build_graph.argtypes = [
-        _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int,
+    lib.markoff_build.argtypes = [
         _ct.c_int,
-        _ct.c_uint32,
-        _ct.POINTER(_ct.c_int),
-        _ct.POINTER(_ct.c_uint32),
-        _ct.POINTER(_ct.c_uint32),
+        _ct.c_int,
+        _ct.c_int,
+        _ct.c_int,
+        _ct.c_int,
+        _ct.POINTER(_ct.c_void_p),
     ]
-    lib.build_graph.restype = _ct.c_int
+    lib.markoff_build.restype = _ct.c_int
+
+    lib.markoff_free.argtypes = [_ct.c_void_p]
+    lib.markoff_free.restype = None
+
+    lib.markoff_node_count.argtypes = [_ct.c_void_p]
+    lib.markoff_node_count.restype = _ct.c_uint32
+
+    lib.markoff_component_count.argtypes = [_ct.c_void_p]
+    lib.markoff_component_count.restype = _ct.c_uint32
+
+    lib.markoff_nodes.argtypes = [_ct.c_void_p]
+    lib.markoff_nodes.restype = _ct.POINTER(_CNode)
+
+    lib.markoff_components.argtypes = [_ct.c_void_p]
+    lib.markoff_components.restype = _ct.POINTER(_CComponent)
+
+    lib.markoff_component_csr.argtypes = [
+        _ct.c_void_p,
+        _ct.c_uint32,
+        _ct.POINTER(_ct.c_void_p),
+    ]
+    lib.markoff_component_csr.restype = _ct.c_int
+
+    lib.markoff_csr_free.argtypes = [_ct.c_void_p]
+    lib.markoff_csr_free.restype = None
+
     return lib
 
 
@@ -111,173 +175,258 @@ def _is_prime(n: int) -> bool:
     return True
 
 
-def _u32_buffer(capacity: int) -> array:
-    if array(_U32_ARRAY_CODE).itemsize != _ct.sizeof(_ct.c_uint32):
-        raise RuntimeError("array('I') is not 32-bit on this platform")
-    return array(_U32_ARRAY_CODE, [0]) * int(capacity)
-
-
-def _as_u32_ptr(buf: array):
-    return (_ct.c_uint32 * len(buf)).from_buffer(buf)
-
-
-def _default_capacity(p: int) -> int:
-    return 8 if p == 2 else 2 * int(p) * int(p)
-
-
-def _decode_vertex(V: int, p: int) -> Triple:
-    z, rem = divmod(int(V), p * p)
-    y, x = divmod(rem, p)
-    return int(x), int(y), int(z)
-
-
 def _normalize(vertex: Triple, p: int) -> Triple:
     x, y, z = vertex
     return int(x) % p, int(y) % p, int(z) % p
 
 
-class _MarkoffGraph:
+def _triple(node: _CNode) -> Triple:
+    return int(node.x), int(node.y), int(node.z)
+
+
+class MarkoffGraph:
+    """Connected components of a Markoff-type surface over a prime field.
+
+    The surface is
+
+        x^2 + y^2 + z^2 = x*y*z + A*x + B*y + C*z + D  mod p.
+
+    The modulus must be prime. Coordinates are stored as uint16_t and node
+    counts as uint32_t, so this builder requires 2*p*p <= 2^32 - 1.  Thus p
+    must be at most 46340; since p is prime, the largest possible p is 46337.
+    """
+
     __slots__ = (
-        "_A", "_B", "_C", "_D", "_prime",
-        "_nodes_u32", "_roots_u32", "_root_sizes", "_component_count",
+        "_A",
+        "_B",
+        "_C",
+        "_D",
+        "_prime",
+        "_lib",
+        "_handle",
+        "_nodes",
+        "_components",
+        "_node_count",
+        "_component_count",
+        "_root_sizes",
+        "_root_indices",
     )
 
     def __init__(
         self,
-        *,
         A: int,
         B: int,
         C: int,
         D: int,
         prime: int,
-        nodes_u32: array,
-        roots_u32: array,
-        component_count: int,
+        *,
+        lib_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        p = int(prime)
+        if p <= 1:
+            raise ValueError("prime must be > 1")
+        if p > _MAX_PRIME_BY_NODE_COUNT:
+            raise ValueError(
+                f"prime must be <= {_MAX_PRIME_BY_NODE_COUNT} because 2*p*p must fit in uint32; got {p}"
+            )
+        if not _is_prime(p):
+            raise ValueError(f"modulus must be prime for this field-based builder; got {p}")
+
         self._A = int(A)
         self._B = int(B)
         self._C = int(C)
         self._D = int(D)
-        self._prime = int(prime)
-        self._nodes_u32 = nodes_u32
-        self._roots_u32 = roots_u32
-        self._component_count = int(component_count)
+        self._prime = p
+        self._lib = _configure_library(_load_library(lib_path))
+        self._handle = _ct.c_void_p()
+        self._nodes = None
+        self._components = None
+        self._node_count = 0
+        self._component_count = 0
+        self._root_sizes: Dict[Triple, int] = {}
+        self._root_indices: Dict[Triple, int] = {}
 
+        status = self._lib.markoff_build(
+            self._A,
+            self._B,
+            self._C,
+            self._D,
+            self._prime,
+            _ct.byref(self._handle),
+        )
+        if status < 0:
+            message = _ERROR_MESSAGES.get(status, "unknown error")
+            raise RuntimeError(f"markoff_build failed with code {status}: {message}")
+        if not self._handle.value:
+            raise RuntimeError("markoff_build succeeded but returned a null graph handle")
+
+        self._node_count = int(self._lib.markoff_node_count(self._handle))
+        self._component_count = int(self._lib.markoff_component_count(self._handle))
+        self._nodes = self._lib.markoff_nodes(self._handle)
+        self._components = self._lib.markoff_components(self._handle)
+        if self._node_count and not self._nodes:
+            self.close()
+            raise RuntimeError("markoff_nodes returned null for a nonempty graph")
+        if self._component_count and not self._components:
+            self.close()
+            raise RuntimeError("markoff_components returned null for a nonempty graph")
+
+        self._index_roots()
+
+    def _require_open(self) -> None:
+        if self._handle is None or not self._handle.value:
+            raise RuntimeError("MarkoffGraph is closed")
+
+    def _node_at(self, i: int) -> _CNode:
+        self._require_open()
+        assert self._nodes is not None
+        return self._nodes[int(i)]
+
+    def _component_at(self, i: int) -> _CComponent:
+        self._require_open()
+        assert self._components is not None
+        return self._components[int(i)]
+
+    def _index_roots(self) -> None:
         root_sizes: Dict[Triple, int] = {}
-        for r in self._roots_u32:
-            root = _decode_vertex(int(r), self._prime)
-            root_sizes[root] = root_sizes.get(root, 0) + 1
+        root_indices: Dict[Triple, int] = {}
+
+        for i in range(self._component_count):
+            component = self._component_at(i)
+            root_index = int(component.root_index)
+            root = _triple(self._node_at(root_index))
+            root_sizes[root] = int(component.size)
+            root_indices[root] = root_index
+
         self._root_sizes = root_sizes
+        self._root_indices = root_indices
+
+    def close(self) -> None:
+        """Release the C-owned graph memory."""
+        if self._handle is not None and self._handle.value:
+            self._lib.markoff_free(self._handle)
+            self._handle = _ct.c_void_p()
+            self._nodes = None
+            self._components = None
 
     def nodes(self) -> Iterator[Triple]:
-        p = self._prime
-        for V in self._nodes_u32:
-            yield _decode_vertex(int(V), p)
-
-    def edges(self) -> Iterator[Tuple[Triple, Triple]]:
-        for v in self.nodes():
-            for w in self.neighbors(v):
-                yield v, w
+        """Iterate over all solution triples."""
+        self._require_open()
+        for i in range(self._node_count):
+            yield _triple(self._node_at(i))
 
     def roots(self) -> Dict[Triple, int]:
+        """Return component-root triples with their component sizes."""
+        self._require_open()
         return dict(self._root_sizes)
 
-    def components(self) -> Dict[Triple, Set[Triple]]:
-        p = self._prime
-        components: Dict[Triple, Set[Triple]] = {}
-        for V, R in zip(self._nodes_u32, self._roots_u32):
-            root = _decode_vertex(int(R), p)
-            node = _decode_vertex(int(V), p)
-            components.setdefault(root, set()).add(node)
-        return components
-
     def component(self, root: Triple) -> Set[Triple]:
-        p = self._prime
-        root = _normalize(root, p)
-        if root not in self._root_sizes:
-            raise KeyError(f"not a component root modulo {p}: {root!r}")
+        """Return the component whose root is the given root triple."""
+        self._require_open()
+        root = _normalize(root, self._prime)
+        if root not in self._root_indices:
+            raise KeyError(f"not a component root modulo {self._prime}: {root!r}")
 
-        nodes: Set[Triple] = set()
-        for V, R in zip(self._nodes_u32, self._roots_u32):
-            if _decode_vertex(int(R), p) == root:
-                nodes.add(_decode_vertex(int(V), p))
-        return nodes
+        root_index = self._root_indices[root]
+        return {
+            _triple(self._node_at(i))
+            for i in range(self._node_count)
+            if int(self._node_at(i).root) == root_index
+        }
 
-    def neighbors(self, vertex: Triple) -> Tuple[Triple, Triple, Triple]:
-        p = self._prime
-        x, y, z = _normalize(vertex, p)
-        if not self._is_solution((x, y, z)):
-            raise KeyError(f"not a solution vertex modulo {p}: {vertex!r}")
 
-        sx = ((y * z + self._A - x) % p, y, z)
-        sy = (x, (x * z + self._B - y) % p, z)
-        sz = (x, y, (x * y + self._C - z) % p)
-        return sx, sy, sz
+    def _component_root_index(self, root: Triple) -> int:
+        self._require_open()
+        root = _normalize(root, self._prime)
+        if root not in self._root_indices:
+            raise KeyError(f"not a component root modulo {self._prime}: {root!r}")
+        return self._root_indices[root]
 
-    def _is_solution(self, vertex: Triple) -> bool:
-        p = self._prime
-        x, y, z = vertex
-        lhs = (x*x + y*y + z*z) % p
-        rhs = (x*y*z + self._A*x + self._B*y + self._C*z + self._D) % p
-        return lhs == rhs
+    def _component_csr_arrays(self, root: Triple):
+        """Return NumPy arrays for the component CSR adjacency matrix.
+
+        This private helper asks C to build the SciPy-style CSR buffers:
+        double* data, int* indices, int* indptr, and a uint32_t* local-to-global
+        node map. The buffers are copied into NumPy arrays before the C CSR
+        object is freed, so the returned arrays are safe to keep.
+        """
+        self._require_open()
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise ImportError(
+                'CSR export requires numpy. Install it with: python -m pip install "markoff-graph[eig]"'
+            ) from exc
+
+        root_index = self._component_root_index(root)
+        csr_handle = _ct.c_void_p()
+        status = self._lib.markoff_component_csr(
+            self._handle,
+            _ct.c_uint32(root_index),
+            _ct.byref(csr_handle),
+        )
+        if status < 0:
+            message = _ERROR_MESSAGES.get(status, "unknown error")
+            raise RuntimeError(f"markoff_component_csr failed with code {status}: {message}")
+        if not csr_handle.value:
+            raise RuntimeError("markoff_component_csr succeeded but returned a null CSR handle")
+
+        try:
+            csr = _ct.cast(csr_handle, _ct.POINTER(_CCSR)).contents
+            size = int(csr.size)
+            nnz = int(csr.nnz)
+            data = np.ctypeslib.as_array(csr.data, shape=(nnz,)).copy()
+            indices = np.ctypeslib.as_array(csr.indices, shape=(nnz,)).copy()
+            indptr = np.ctypeslib.as_array(csr.indptr, shape=(size + 1,)).copy()
+            global_indices = np.ctypeslib.as_array(csr.nodes, shape=(size,)).copy()
+            triples = tuple(_triple(self._node_at(int(i))) for i in global_indices)
+            return data, indices, indptr, global_indices, triples
+        finally:
+            self._lib.markoff_csr_free(csr_handle)
+
+    def _store_eig_values(self, root: Triple, eigenvalue: float, global_indices, vector) -> None:
+        """Store a SciPy-computed eigenpair back into the C-owned graph object."""
+        self._require_open()
+        root_index = self._component_root_index(root)
+        assert self._components is not None
+        assert self._nodes is not None
+
+        for ci in range(self._component_count):
+            component = self._components[ci]
+            if int(component.root_index) == root_index:
+                component.eigenvalue = float(eigenvalue)
+                break
+
+        for gi, value in zip(global_indices, vector):
+            self._nodes[int(gi)].eigenvector = float(value)
+
+    def eig(self, root: Triple):
+        """Return ``(eigenvalue, eigenvector_dict)`` for one component.
+
+        This uses the optional SciPy backend. Install it with:
+
+            python -m pip install "markoff-graph[eig]"
+        """
+        from .eig import eig
+
+        return eig(self, root)
+
+    def __enter__(self) -> "MarkoffGraph":
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
+        status = "closed" if self._handle is None or not self._handle.value else "open"
         return (
-            f"MarkoffGraph(nodes={len(self._nodes_u32)}, "
-            f"components={self._component_count}, prime={self._prime})"
+            f"MarkoffGraph(nodes={self._node_count}, components={self._component_count}, "
+            f"prime={self._prime}, {status})"
         )
-
-
-def markoff(
-    A: int,
-    B: int,
-    C: int,
-    D: int,
-    prime: int,
-    *,
-    lib_path: str | os.PathLike[str] | None = None,
-    capacity: Optional[int] = None,
-) -> _MarkoffGraph:
-    """Build the Vieta graph modulo a prime p.
-
-    The graph is formed from solutions to
-
-        x^2 + y^2 + z^2 = x*y*z + A*x + B*y + C*z + D  mod p.
-
-    The modulus must be prime and at most 1621.
-    """
-    p = int(prime)
-    if p <= 1:
-        raise ValueError("prime must be > 1")
-    if p > _MAX_PRIME_U32:
-        raise ValueError(f"prime must be <= {_MAX_PRIME_U32}; got {p}")
-    if not _is_prime(p):
-        raise ValueError(f"modulus must be prime for this field-based builder; got {p}")
-
-    cap = int(_default_capacity(p) if capacity is None else capacity)
-    if cap <= 0:
-        raise ValueError("capacity must be positive")
-
-    lib = _configure_library(_load_library(lib_path))
-    nodes = _u32_buffer(cap)
-    roots = _u32_buffer(cap)
-    n_out = _ct.c_int(0)
-
-    component_count = lib.build_graph(
-        int(A), int(B), int(C), int(D), p, _ct.c_uint32(cap),
-        _ct.byref(n_out), _as_u32_ptr(nodes), _as_u32_ptr(roots),
-    )
-    if component_count < 0:
-        message = _ERROR_MESSAGES.get(component_count, "unknown error")
-        extra = f"; capacity={cap}, partial_count={n_out.value}" if component_count == -2 else ""
-        raise RuntimeError(f"build_graph failed with code {component_count}: {message}{extra}")
-
-    n = int(n_out.value)
-    del nodes[n:]
-    del roots[n:]
-
-    return _MarkoffGraph(
-        A=int(A), B=int(B), C=int(C), D=int(D), prime=p,
-        nodes_u32=nodes, roots_u32=roots,
-        component_count=int(component_count),
-    )

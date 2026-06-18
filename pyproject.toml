@@ -4,12 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "markoff-graph"
-version = "0.0.3"
+version = "0.0.6"
 description = "Finite-field Markoff graph components"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
+
+[project.optional-dependencies]
+nx = ["networkx>=3"]
+eig = ["numpy>=1.24", "scipy>=1.10"]
+all = ["networkx>=3", "numpy>=1.24", "scipy>=1.10"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
